@@ -1,31 +1,68 @@
 -module(eflame).
--export([apply/3, apply/5]).
+-export([apply/3, apply/4, apply/5, apply/6,
+         trace/2, stop_trace/3]).
 
 -define(RESOLUTION, 1000). %% us
 -record(dump, {stack=[], us=0, acc=[]}). % per-process state
 
 apply(M, F, A) ->
-    ?MODULE:apply(normal_with_children, "stacks.out", M, F, A).
+    apply(M, F, A, infinity).
+
+apply(M, F, A, Timeout) ->
+    ?MODULE:apply(normal_with_children, "stacks.out", M, F, A, Timeout).
 
 apply(Mode, OutputFile, M, F, A) ->
+    apply(Mode, OutputFile, M, F, A, infinity).
+
+apply(Mode, OutputFile, M, F, A, Timeout) ->
     Tracer = spawn_tracer(),
 
-    start_trace(Tracer, self(), Mode),
+    ok = start_trace(Tracer, self(), Mode),
     Return = (catch erlang:apply(M, F, A)),
-    {ok, Bytes} = stop_trace(Tracer, self()),
+    ok = stop_trace_each([self()]),
+    {ok, Bytes} = stop_tracer(Tracer, Timeout),
 
     ok = file:write_file(OutputFile, Bytes),
     Return.
 
-start_trace(Tracer, Target, Mode) ->
+trace(Targets, Mode) ->
+    Tracer = spawn_tracer(),
+    ok = start_trace(Tracer, Targets, Mode),
+    Tracer.
+
+stop_trace(Tracer, Targets, OutputFile) ->
+    stop_trace(Tracer, Targets, OutputFile, infinity).
+
+stop_trace(Tracer, Targets, OutputFile, Timeout) ->
+    ok = stop_trace_each(Targets),
+    {ok, Bytes} = stop_tracer(Tracer, Timeout),
+    ok = file:write_file(OutputFile, Bytes),
+    ok.
+
+stop_trace_each([]) ->
+    ok;
+stop_trace_each([ T | Targets ]) ->
+    erlang:trace(T, false, [all]),
+    Ref = erlang:trace_delivered(T),
+    receive {trace_delivered, T, Ref} -> ok end,
+    stop_trace_each(Targets).
+
+start_trace(Tracer, Targets, Mode) when is_list(Targets) ->
     MatchSpec = [{'_', [], [{message, {{cp, {caller}}}}]}],
     erlang:trace_pattern(on_load, MatchSpec, [local]),
     erlang:trace_pattern({'_', '_', '_'}, MatchSpec, [local]),
-    erlang:trace(Target, true, [{tracer, Tracer} | trace_flags(Mode)]),
-    ok.
+    ok = start_trace_each(Tracer, Targets, Mode),
+    ok;
+start_trace(Tracer, Target, Mode) ->
+    start_trace(Tracer, [Target], Mode).
 
-stop_trace(Tracer, Target) ->
-    erlang:trace(Target, false, [all]),
+start_trace_each(_Tracer, [], _Mode) ->
+    ok;
+start_trace_each(Tracer, [ T | Targets ], Mode) ->
+    erlang:trace(T, true, [{tracer, Tracer} | trace_flags(Mode)]),
+    start_trace_each(Tracer, Targets, Mode).
+
+stop_tracer(Tracer, Timeout) ->
     Tracer ! {dump_bytes, self()},
 
     Ret = receive {bytes, B} -> {ok, B}
@@ -35,7 +72,7 @@ stop_trace(Tracer, Target) ->
     exit(Tracer, normal),
     Ret.
 
-spawn_tracer() -> spawn(fun() -> trace_listener(dict:new()) end).
+spawn_tracer() -> spawn_link(fun() -> trace_listener(dict:new()) end).
 
 trace_flags(normal) ->
     [call, arity, return_to, timestamp, running];
@@ -60,6 +97,8 @@ trace_listener(State) ->
                 error -> #dump{}
             end,
 
+            %%io:format("Term: ~p\n\nPidState: ~p\n\n", [Term, PidState]),
+
             NewPidState = trace_proc_stream(Term, PidState),
 
             D1 = dict:erase(PidS, State),
@@ -83,7 +122,7 @@ new_state(#dump{us=Us, acc=Acc} = State, Stack, Ts) ->
             case NOverlaps of
                 X when X >= 1 ->
                     StackRev = lists:reverse(Stack),
-                    Stacks = [StackRev || _ <- lists:seq(1, NOverlaps)],
+                    Stacks = [{UsTs, StackRev} || _ <- lists:seq(1, NOverlaps)],
                     State#dump{us=Us+Overlapped, acc=lists:append(Stacks, Acc), stack=Stack};
                 _ ->
                     State#dump{stack=Stack}
@@ -136,7 +175,8 @@ entry_to_iolist(A) when is_atom(A) ->
     [atom_to_binary(A, utf8)].
 
 dump_to_iolist(Pid, #dump{acc=Acc}) ->
-    [[pid_to_list(Pid), <<";">>, stack_collapse(S), <<"\n">>] || S <- lists:reverse(Acc)].
+    [[io_lib:format("~p", [Us]), <<";">>, pid_to_list(Pid), <<";">>,
+      stack_collapse(S), <<"\n">>] || {Us, S} <- lists:reverse(Acc)].
 
 intercalate(Sep, Xs) -> lists:concat(intersperse(Sep, Xs)).
 
